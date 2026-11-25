@@ -38,43 +38,38 @@ class ProduceExcelProcessor:
 
   @staticmethod
   def _clone_first_sheet_into(excel_app, target_wb, source_path, new_tab_name):
-    """Clones the first worksheet of source_path into target_wb safely using a visible anchor."""
+    """Clones the first worksheet of source_path into target_wb safely."""
     # Delete any existing tab matching new_tab_name (case-insensitive)
     for sheet in list(target_wb.sheets):
       if new_tab_name.lower() in sheet.name.lower():
         sheet.delete()
 
-    # Find the last VISIBLE sheet to use as a valid COM Copy anchor
+    # Find the last VISIBLE sheet to use as a valid anchor
     visible_sheets = [s for s in target_wb.sheets if s.visible]
     anchor_sheet = visible_sheets[-1] if visible_sheets else target_wb.sheets[0]
     anchor_sheet.visible = True
 
     before_count = len(target_wb.sheets)
 
-    wb_src = excel_app.books.open(source_path)
+    wb_src = excel_app.books.open(
+        source_path, read_only=True, ignore_read_only_recommended=True
+    )
     try:
       ws_src = wb_src.sheets[0]
-      ws_src.api.Copy(After=anchor_sheet.api)
 
-      # Verify a new sheet was actually added to target_wb
-      if len(target_wb.sheets) > before_count:
-        cloned_sheet = target_wb.sheets[anchor_sheet.index]
-        cloned_sheet.name = new_tab_name
-      else:
-        # Fallback if Excel blocked cross-format (.xls -> .xlsx) sheet cloning
+      # Primary: xlwings native Sheet.copy() avoids raw pywin32 COM bool-dispatch quirks
+      try:
+        ws_src.copy(after=anchor_sheet, name=new_tab_name)
+      except Exception:
+        pass
+
+      # Fallback if Sheet.copy() didn't insert a sheet (e.g., Protected View or .xls -> .xlsx)
+      if len(target_wb.sheets) == before_count:
         new_sheet = target_wb.sheets.add(
             name=new_tab_name, after=anchor_sheet
         )
-        src_last = ws_src.used_range.last_cell
-        if (
-            src_last.row > 1
-            or src_last.column > 1
-            or ws_src.range("A1").value is not None
-        ):
-          ws_src.range((1, 1), (src_last.row, src_last.column)).copy(
-              destination=new_sheet.range("A1")
-          )
-          excel_app.api.CutCopyMode = False
+        ws_src.api.Cells.Copy(new_sheet.api.Cells)
+        excel_app.api.CutCopyMode = False
     finally:
       wb_src.close()
 
@@ -146,6 +141,9 @@ class ProduceExcelProcessor:
     ws_calc.range("E2").formula = (
         '=IF(ISBLANK(\'Previous Week\'!K2),"",\'Previous Week\'!K2)'
     )
+    ws_calc.range("F2").formula = (
+        '=IFERROR(IF(OR(\'Previous Week\'!C1="*",D2+E2<>0),"*",""),"")'
+    )
 
     last_row = max(
         ws_calc.used_range.last_cell.row,
@@ -155,6 +153,7 @@ class ProduceExcelProcessor:
     if last_row > 2:
       ws_calc.range(f"A2:A{last_row}").api.FillDown()
       ws_calc.range(f"E2:E{last_row}").api.FillDown()
+      ws_calc.range(f"F2:F{last_row}").api.FillDown()
 
     # Step 8: Hide the tabs again
     for tab_name in target_tabs:
