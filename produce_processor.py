@@ -5,6 +5,80 @@ from xlwings.utils import rgb_to_int
 class ProduceExcelProcessor:
 
   @staticmethod
+  def _convert_columns_to_number(ws, columns, start_row=2):
+    """Converts string-formatted numeric cells in the given columns into real numbers."""
+    last_row = ws.used_range.last_cell.row
+    if last_row < start_row:
+      return
+
+    for col in columns:
+      col_range = ws.range(f"{col}{start_row}:{col}{last_row}")
+      col_range.number_format = "General"
+
+      values = col_range.value
+      if not isinstance(values, list):
+        values = [values]
+
+      converted = []
+      changed = False
+      for val in values:
+        if isinstance(val, str):
+          cleaned = val.strip()
+          if cleaned:
+            try:
+              num = float(cleaned)
+              val = int(num) if num.is_integer() else num
+              changed = True
+            except ValueError:
+              pass
+        converted.append([val])
+
+      if changed:
+        col_range.value = converted
+
+  @staticmethod
+  def _clone_first_sheet_into(excel_app, target_wb, source_path, new_tab_name):
+    """Clones the first worksheet of source_path into target_wb safely using a visible anchor."""
+    # Delete any existing tab matching new_tab_name (case-insensitive)
+    for sheet in list(target_wb.sheets):
+      if new_tab_name.lower() in sheet.name.lower():
+        sheet.delete()
+
+    # Find the last VISIBLE sheet to use as a valid COM Copy anchor
+    visible_sheets = [s for s in target_wb.sheets if s.visible]
+    anchor_sheet = visible_sheets[-1] if visible_sheets else target_wb.sheets[0]
+    anchor_sheet.visible = True
+
+    before_count = len(target_wb.sheets)
+
+    wb_src = excel_app.books.open(source_path)
+    try:
+      ws_src = wb_src.sheets[0]
+      ws_src.api.Copy(After=anchor_sheet.api)
+
+      # Verify a new sheet was actually added to target_wb
+      if len(target_wb.sheets) > before_count:
+        cloned_sheet = target_wb.sheets[anchor_sheet.index]
+        cloned_sheet.name = new_tab_name
+      else:
+        # Fallback if Excel blocked cross-format (.xls -> .xlsx) sheet cloning
+        new_sheet = target_wb.sheets.add(
+            name=new_tab_name, after=anchor_sheet
+        )
+        src_last = ws_src.used_range.last_cell
+        if (
+            src_last.row > 1
+            or src_last.column > 1
+            or ws_src.range("A1").value is not None
+        ):
+          ws_src.range((1, 1), (src_last.row, src_last.column)).copy(
+              destination=new_sheet.range("A1")
+          )
+          excel_app.api.CutCopyMode = False
+    finally:
+      wb_src.close()
+
+  @staticmethod
   def process_region_workbook(excel_app, wb, csv_path, xls_path, ad_xlsx_path):
     """Orchestrates all processing steps on WK##_PRODUCE_<REGION>.xlsx."""
     target_tabs = ["Current Week", "Previous Week", "Calculations"]
@@ -64,6 +138,9 @@ class ProduceExcelProcessor:
     finally:
       wb_csv.close()
 
+    # Step 6b: Ensure columns E and H in "Current Week" are stored as numbers, not strings
+    ProduceExcelProcessor._convert_columns_to_number(ws_current, ["E", "H"])
+
     # Step 7: Fix formulas in "Calculations" tab and propagate to the bottom
     ws_calc.range("A2").formula = "='Previous Week'!O2"
     ws_calc.range("E2").formula = (
@@ -92,48 +169,26 @@ class ProduceExcelProcessor:
     # Step 11: Update date formula on Cost & Sell
     ProduceExcelProcessor.update_date(wb)
 
+    # Step 11b: L-Region specific formula redirect on Cost & Sell
+    if "l-region" in wb.name.lower():
+      ProduceExcelProcessor.redirect_formula_update(wb)
+
     # Step 12: Touch-ups (reorder tabs and apply tab colors)
     ProduceExcelProcessor.touch_ups(wb)
 
   @staticmethod
   def update_sabw_price_book(excel_app, wb, xls_path):
     """Clones the SABW Price Book worksheet directly to preserve layout, widths, and barcodes."""
-    # 1. Delete the existing tab that CONTAINS "SABW Price Book" in the name
-    for sheet in list(wb.sheets):
-      if "sabw price book" in sheet.name.lower():
-        sheet.delete()
-
-    # 2. Open the uploaded "SABW Price Book.xls" file and clone the entire sheet into wb
-    wb_xls = excel_app.books.open(xls_path)
-    try:
-      ws_xls = wb_xls.sheets[0]
-      ws_xls.api.Copy(After=wb.sheets[-1].api)
-    finally:
-      wb_xls.close()
-
-    # 3. Rename the newly cloned sheet to "SABW Price Book"
-    cloned_sheet = wb.sheets[-1]
-    cloned_sheet.name = "SABW Price Book"
+    ProduceExcelProcessor._clone_first_sheet_into(
+        excel_app, wb, xls_path, "SABW Price Book"
+    )
 
   @staticmethod
   def update_weekly_produce_ad(excel_app, wb, ad_xlsx_path):
     """Clones the Weekly Produce Ad worksheet directly to preserve spacing, formatting, and styles."""
-    # 1. Delete the existing tab named "Weekly Produce Ad" (or containing it, case-insensitive)
-    for sheet in list(wb.sheets):
-      if "weekly produce ad" in sheet.name.lower():
-        sheet.delete()
-
-    # 2. Open the uploaded "AD XX Produce Final Keyed & proofed.xlsx" file and clone its sheet into wb
-    wb_ad = excel_app.books.open(ad_xlsx_path)
-    try:
-      ws_ad = wb_ad.sheets[0]
-      ws_ad.api.Copy(After=wb.sheets[-1].api)
-    finally:
-      wb_ad.close()
-
-    # 3. Rename the newly cloned sheet to "Weekly Produce Ad"
-    cloned_sheet = wb.sheets[-1]
-    cloned_sheet.name = "Weekly Produce Ad"
+    ProduceExcelProcessor._clone_first_sheet_into(
+        excel_app, wb, ad_xlsx_path, "Weekly Produce Ad"
+    )
 
   @staticmethod
   def update_date(wb):
@@ -147,6 +202,26 @@ class ProduceExcelProcessor:
 
     ws_cost_sell.activate()
     ws_cost_sell.range("B1").formula = "='Weekly Produce Ad'!B4"
+
+  @staticmethod
+  def redirect_formula_update(wb):
+    """L-Region only: Updates J3 on 'Cost & Sell' and propagates down to the bottom."""
+    try:
+      ws_cost_sell = wb.sheets["Cost & Sell"]
+    except Exception as e:
+      raise ValueError(
+          f"Could not find sheet 'Cost & Sell' in {wb.name}."
+      ) from e
+
+    ws_cost_sell.activate()
+    ws_cost_sell.range("J3").formula = (
+        '=IFERROR(_xlfn.LET(x,VLOOKUP(B3,\'SABW Price Book\'!E:Q,13,FALSE),'
+        'IF(x=0,"",x)),"")'
+    )
+
+    last_row = ws_cost_sell.used_range.last_cell.row
+    if last_row > 3:
+      ws_cost_sell.range(f"J3:J{last_row}").api.FillDown()
 
   @staticmethod
   def touch_ups(wb):
