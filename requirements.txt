@@ -1,0 +1,5 @@
+customtkinter>=5.2.2
+tkinterdnd2>=0.3.0
+xlwings>=0.31.0
+pywin32>=306
+pyinstaller>=6.0.0
