@@ -1,8 +1,13 @@
 import os
 import re
+import shutil
+import tempfile
+import traceback
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
+from produce_processor import ProduceExcelProcessor
 from tkinterdnd2 import DND_FILES, TkinterDnD
+import xlwings as xw
 
 # Set up CustomTkinter appearance
 ctk.set_appearance_mode("Dark")
@@ -19,7 +24,7 @@ class ProduceProcessorApp(ctk.CTk, TkinterDnD.DnDWrapper):
 
     # Window Configuration
     self.title("Produce Data Processor")
-    self.geometry("760x1040")
+    self.geometry("760x1120")
     self.resizable(False, False)
 
     # Region configurations: Display Name -> Expected Region Token in Filename
@@ -41,6 +46,7 @@ class ProduceProcessorApp(ctk.CTk, TkinterDnD.DnDWrapper):
     # UI References for dynamic updates
     self.region_ui_elements = {}
     self.ad_status_label = None
+    self.ad_week_entry = None
 
     self.create_widgets()
 
@@ -55,9 +61,36 @@ class ProduceProcessorApp(ctk.CTk, TkinterDnD.DnDWrapper):
 
     # Scrollable frame for clean layout
     main_frame = ctk.CTkScrollableFrame(
-        self, width=710, height=900, fg_color="transparent"
+        self, width=710, height=1000, fg_color="transparent"
     )
     main_frame.pack(fill="both", expand=True, padx=20, pady=10)
+
+    # 0. AD Week # Input Section (Required)
+    input_frame = ctk.CTkFrame(
+        main_frame, fg_color="#2b2b2b", corner_radius=8, height=60
+    )
+    input_frame.pack(fill="x", pady=(0, 6))
+    input_frame.pack_propagate(False)
+
+    ad_week_label = ctk.CTkLabel(
+        input_frame,
+        text="AD Week # (Required)",
+        font=ctk.CTkFont(size=14, weight="bold"),
+    )
+    ad_week_label.pack(side="left", padx=15)
+
+    self.ad_week_entry = ctk.CTkEntry(
+        input_frame,
+        placeholder_text="e.g. 15 or 20",
+        width=200,
+        height=32,
+        font=ctk.CTkFont(size=13),
+    )
+    self.ad_week_entry.pack(side="right", padx=15)
+
+    # Separator
+    sep_top = ctk.CTkFrame(main_frame, height=2, fg_color="#333333")
+    sep_top.pack(fill="x", pady=14)
 
     # Section Header: Regions
     region_header = ctk.CTkLabel(
@@ -96,7 +129,20 @@ class ProduceProcessorApp(ctk.CTk, TkinterDnD.DnDWrapper):
         hover_color="#144870",
         command=self.on_start_processing,
     )
-    self.process_btn.pack(fill="x", pady=(25, 10))
+    self.process_btn.pack(fill="x", pady=(25, 5))
+
+    # Loading status text and progress bar
+    self.loading_label = ctk.CTkLabel(
+        main_frame,
+        text="",
+        font=ctk.CTkFont(size=13, slant="italic", weight="bold"),
+        text_color="#3498db",
+    )
+    self.loading_label.pack(pady=(5, 2))
+
+    self.progress_bar = ctk.CTkProgressBar(
+        main_frame, mode="indeterminate", width=300, height=12
+    )
 
   def create_region_zone(self, parent, display_name, region_token):
     frame = ctk.CTkFrame(
@@ -247,7 +293,6 @@ class ProduceProcessorApp(ctk.CTk, TkinterDnD.DnDWrapper):
       )
       return
 
-    # Regex for WK##_PRODUCE_<REGION>.XLSX (case-insensitive, ## = any alphanumeric/text)
     expected_xlsx_pattern = re.compile(
         rf"^wk.+_produce_{re.escape(region_token)}\.xlsx$", re.IGNORECASE
     )
@@ -359,7 +404,6 @@ class ProduceProcessorApp(ctk.CTk, TkinterDnD.DnDWrapper):
 
     file_name = os.path.basename(file_path)
 
-    # Matches: AD ## - Produce Final Keyed&Proofed.xlsx (allows optional spaces around '-' and '&')
     ad_pattern = re.compile(
         r"^ad\s*.+\s*-\s*produce final keyed\s*&\s*proofed\.xlsx$",
         re.IGNORECASE,
@@ -390,10 +434,35 @@ class ProduceProcessorApp(ctk.CTk, TkinterDnD.DnDWrapper):
       self.process_ad_file(list(files))
 
   # -------------------------------------------------------------------------
-  # Start Processing Validation Check
+  # Safe Excel Cleanup Helper
+  # -------------------------------------------------------------------------
+  @staticmethod
+  def _close_excel_app(excel_app):
+    if excel_app is None:
+      return
+    try:
+      if callable(getattr(excel_app, "quit", None)):
+        excel_app.quit()
+      else:
+        excel_app.kill()
+    except Exception:
+      try:
+        excel_app.kill()
+      except Exception:
+        pass
+
+  # -------------------------------------------------------------------------
+  # Start Processing Validation & Execution
   # -------------------------------------------------------------------------
   def on_start_processing(self):
-    # 1. Check AD ## - Produce Final Keyed&Proofed file is uploaded
+    ad_week = self.ad_week_entry.get().strip()
+    if not ad_week:
+      messagebox.showwarning(
+          "Missing Input",
+          "Please enter a value for 'AD Week #' before starting.",
+      )
+      return
+
     if not self.ad_final_file:
       messagebox.showwarning(
           "Missing Required File",
@@ -402,7 +471,6 @@ class ProduceProcessorApp(ctk.CTk, TkinterDnD.DnDWrapper):
       )
       return
 
-    # 2. Check that at least one of the 4 region zones has all 3 expected files
     completed_regions = []
     partial_regions = []
 
@@ -433,13 +501,122 @@ class ProduceProcessorApp(ctk.CTk, TkinterDnD.DnDWrapper):
       )
       return
 
-    # Validation passed — ready for processing logic
-    messagebox.showinfo(
-        "Validation Passed",
-        "Ready to process!\n\n"
-        f"AD Master File: {os.path.basename(self.ad_final_file)}\n"
-        f"Populated Regions: {', '.join(completed_regions)}",
+    # Disable button and show progress bar immediately
+    self.process_btn.configure(state="disabled", fg_color="gray")
+    self.loading_label.configure(text="Processing regions, please wait...")
+    self.progress_bar.pack(pady=5)
+    self.progress_bar.start()
+    self.update()
+
+    self.after(
+        150,
+        lambda: self.execute_processing(ad_week, completed_regions),
     )
+
+  def execute_processing(self, ad_week, completed_regions):
+    excel_app = None
+    temp_dir = tempfile.mkdtemp(prefix="produce_processor_")
+    processed_temp_files = []  # List of (region_name, temp_file_path, output_filename)
+
+    try:
+      excel_app = xw.App(visible=False)
+      excel_app.screen_updating = False
+      excel_app.display_alerts = False
+
+      for region_name in completed_regions:
+        self.loading_label.configure(text=f"Processing {region_name}...")
+        self.update()
+
+        orig_xlsx_path = self.region_files[region_name]["xlsx"]
+        xls_path = self.region_files[region_name]["xls"]
+        csv_path = self.region_files[region_name]["csv"]
+        region_token = self.region_ui_elements[region_name]["token"]
+
+        output_filename = f"WK{ad_week}_PRODUCE_{region_token}.xlsx"
+        temp_file_path = os.path.join(temp_dir, output_filename)
+
+        # Copy the original file into an isolated temp directory so the source is never touched
+        shutil.copy2(orig_xlsx_path, temp_file_path)
+        wb = excel_app.books.open(temp_file_path)
+
+        try:
+          ProduceExcelProcessor.process_region_workbook(
+              excel_app, wb, csv_path, xls_path, self.ad_final_file
+          )
+          wb.save()
+          processed_temp_files.append(
+              (region_name, temp_file_path, output_filename)
+          )
+        finally:
+          wb.close()
+
+      # Close Excel cleanly before prompting the user for the output folder
+      self._close_excel_app(excel_app)
+      excel_app = None
+
+      self.progress_bar.stop()
+      self.progress_bar.pack_forget()
+      self.loading_label.configure(text="Select folder to save output files...")
+      self.update()
+
+      # Prompt user once for destination folder after processing finishes
+      while True:
+        dest_folder = filedialog.askdirectory(
+            title="Select Folder to Save Completed Produce File(s)"
+        )
+        if not dest_folder:
+          messagebox.showwarning(
+              "Save Cancelled",
+              "No folder was selected. The processed files were not saved.",
+          )
+          return
+
+        # Verify no original uploaded file will be overwritten in the chosen folder
+        conflict = False
+        for region_name, _, output_filename in processed_temp_files:
+          orig_xlsx = os.path.abspath(self.region_files[region_name]["xlsx"])
+          target_path = os.path.abspath(
+              os.path.join(dest_folder, output_filename)
+          )
+          if target_path == orig_xlsx:
+            messagebox.showerror(
+                "Overwrite Prevented",
+                f"Saving '{output_filename}' into this folder would overwrite"
+                f" the original uploaded file for {region_name}.\n\nPlease"
+                " choose a different folder.",
+            )
+            conflict = True
+            break
+
+        if not conflict:
+          break
+
+      saved_paths = []
+      for _, temp_file_path, output_filename in processed_temp_files:
+        final_dest = os.path.join(dest_folder, output_filename)
+        shutil.copy2(temp_file_path, final_dest)
+        saved_paths.append(final_dest)
+
+      messagebox.showinfo(
+          "Processing Complete",
+          "Successfully saved the following new files:\n\n"
+          + "\n".join(saved_paths),
+      )
+
+    except Exception:
+      messagebox.showerror(
+          "Excel Processing Error",
+          "An error occurred during processing:\n\n" + traceback.format_exc(),
+      )
+    finally:
+      self._close_excel_app(excel_app)
+      excel_app = None
+
+      shutil.rmtree(temp_dir, ignore_errors=True)
+      self.progress_bar.stop()
+      self.progress_bar.pack_forget()
+      self.loading_label.configure(text="")
+      self.process_btn.configure(state="normal", fg_color="#1f6aa5")
 
 
 if __name__ == "__main__":
